@@ -282,6 +282,17 @@ if pcap_dep.found() and cc.has_header('pcap.h', dependencies: pcap_dep)
     dpdk_extra_ldflags += '-l@0@'.format(pcap_lib)
 endif
 
+# check for zmq
+zmq_dep = dependency('libzmq', required: false, method: 'pkg-config')
+zmq_lib = 'zmq'
+if not zmq_dep.found()
+    zmq_dep = cc.find_library(zmq_lib, required: false)
+endif
+if zmq_dep.found() and cc.has_header('zmq.h', dependencies: zmq_dep)
+    dpdk_conf.set('RTE_HAS_LIBZMQ', 1)
+    dpdk_extra_ldflags += '-l@0@'.format(zmq_lib)
+endif
+
 # for clang 32-bit compiles we need libatomic for 64-bit atomic ops
 if cc.get_id() == 'clang' and dpdk_conf.get('RTE_ARCH_64') == false
     atomic_dep = cc.find_library('atomic', required: true)

@@ -40,7 +40,7 @@ mlx5_xstats_get(struct rte_eth_dev *dev, struct rte_eth_xstat *stats,
 {
 	struct mlx5_priv *priv = dev->data->dev_private;
 	unsigned int i;
-	uint64_t counters[n];
+	uint64_t counters[MLX5_MAX_XSTATS];
 	struct mlx5_xstats_ctrl *xstats_ctrl = &priv->xstats_ctrl;
 	uint16_t mlx5_stats_n = xstats_ctrl->mlx5_stats_n;
 
@@ -51,8 +51,12 @@ mlx5_xstats_get(struct rte_eth_dev *dev, struct rte_eth_xstat *stats,
 		stats_n = mlx5_os_get_stats_n(dev);
 		if (stats_n < 0)
 			return stats_n;
-		if (xstats_ctrl->stats_n != stats_n)
+		if (xstats_ctrl->stats_n != stats_n) {
 			mlx5_os_stats_init(dev);
+			mlx5_stats_n = xstats_ctrl->mlx5_stats_n;
+			if (n < mlx5_stats_n)
+				goto out;
+		}
 		ret = mlx5_os_read_dev_counters(dev, counters);
 		if (ret)
 			return ret;
@@ -77,6 +81,7 @@ mlx5_xstats_get(struct rte_eth_dev *dev, struct rte_eth_xstat *stats,
 			}
 		}
 	}
+out:
 	mlx5_stats_n = mlx5_txpp_xstats_get(dev, stats, n, mlx5_stats_n);
 	return mlx5_stats_n;
 }

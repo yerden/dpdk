@@ -9,6 +9,12 @@
 
 #include <ethdev_vdev.h>
 #include <rte_kvargs.h>
+#include <rte_service.h>
+#include <rte_ip.h>
+#include <rte_ring.h>
+#include <rte_cycles.h>
+#include <rte_thash.h>
+#include <rte_service_component.h>
 
 /*
  * Specify ZMQ method to either "connect" or "bind". Default is "connect".
@@ -34,6 +40,8 @@ static const char *valid_arguments[] = {
 	NULL
 };
 
+#define RSS_KEY_SIZE                       40
+
 struct pmd_internals;
 
 struct queue_stat {
@@ -48,6 +56,8 @@ struct zmq_rx_queue {
 
 	void *socket;
 	zmq_msg_t msg;
+
+	struct rte_ring *ring;
 	struct rte_mempool *mb_pool;
 	struct queue_stat stat;
 };
@@ -57,6 +67,12 @@ struct zmq_tx_queue {
 
 	void *socket;
 	struct queue_stat stat;
+};
+
+struct raw_zmq_packet {
+	zmq_msg_t msg;
+	char *data;
+	size_t len;
 };
 
 /* an alias for zmq_bind or zmq_connect */
@@ -78,6 +94,9 @@ struct pmd_internals {
 	void *ctx;
 	void *socket;
 	int socket_type;
+	uint32_t poll_service_id;
+
+	uint8_t rss_key_be[RSS_KEY_SIZE];
 
 	/* zmq SUB socket. */
 	struct zmq_rx_queue rx[RTE_MAX_QUEUES_PER_PORT];
@@ -97,7 +116,7 @@ static struct rte_eth_link pmd_link = {
 	.link_autoneg = RTE_ETH_LINK_FIXED,
 };
 
-RTE_LOG_REGISTER_DEFAULT(eth_zmq_logtype, NOTICE);
+RTE_LOG_REGISTER_DEFAULT(eth_zmq_logtype, DEBUG);
 
 #define PMD_LOG(level, fmt, args...) \
 	rte_log(RTE_LOG_ ## level, eth_zmq_logtype, \
@@ -186,48 +205,49 @@ eth_zmq_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	struct zmq_rx_queue *h = queue;
 	uint16_t num_rx = 0;
 	uint32_t rx_bytes = 0;
-	int caplen;
+	int res;
 
 	if ((h == NULL) || (bufs == NULL) || (nb_pkts == 0))
 		return 0;
 
 	uint16_t port = h->internals->port_id;
-	zmq_msg_t *msg = &h->msg;
 	for (i = 0; i < nb_pkts; i++) {
 		if ((m = rte_pktmbuf_alloc(h->mb_pool)) == NULL) {
 			incr_cnt_one(&h->stat.rx_nombuf);
 			break;
 		}
 
-		caplen = msg_recv_nonempty(msg, h->socket, ZMQ_DONTWAIT);
+		struct raw_zmq_packet *raw_packet;
+		res = rte_ring_sc_dequeue(h->ring, (void **)&raw_packet);
 
-		if (caplen < 0) {
-			if (errno != EAGAIN)
-				PMD_LOG(ERR, "error receiving ZMQ msg: %s", zmq_strerror(errno));
-
+		if (res == -ENOENT) {
 			rte_pktmbuf_free(m);
 			break;
 		}
 
-		if (caplen <= rte_pktmbuf_tailroom(m)) {
+		if (raw_packet->len <= rte_pktmbuf_tailroom(m)) {
 			/* packet will fit in the mbuf, can copy it */
-			rte_memcpy(rte_pktmbuf_mtod(m, void *), zmq_msg_data(msg),
-					caplen);
-			m->data_len = (uint16_t)caplen;
+			rte_memcpy(rte_pktmbuf_mtod(m, void *), (void *)raw_packet->data,
+					raw_packet->len);
+			m->data_len = (uint16_t)raw_packet->len;
 		} else {
 			/* Try read jumbo frame into multi mbufs. */
-			if (unlikely(eth_zmq_rx_jumbo(h->mb_pool, m, zmq_msg_data(msg), caplen) == -1)) {
+			if (unlikely(eth_zmq_rx_jumbo(h->mb_pool, m, (void *)raw_packet->data, raw_packet->len) == -1)) {
 				incr_cnt_one(&h->stat.rx_nombuf);
 				rte_pktmbuf_free(m);
+				zmq_msg_close(&raw_packet->msg);
+				rte_free(raw_packet);
 				break;
 			}
 		}
 
-		m->pkt_len = (uint16_t)caplen;
+		zmq_msg_close(&raw_packet->msg);
+		rte_free(raw_packet);
+		m->pkt_len = (uint16_t)raw_packet->len;
 		m->port = port;
 		bufs[num_rx] = m;
 		num_rx++;
-		rx_bytes += caplen;
+		rx_bytes += raw_packet->len;
 	}
 
 	incr_cnt(&h->stat.pkts, num_rx);
@@ -359,9 +379,125 @@ eth_dev_close(struct rte_eth_dev *dev)
 	return 0;
 }
 
-static int
-eth_dev_configure(struct rte_eth_dev *dev __rte_unused)
+static uint32_t
+softrss_be(rte_be16_t ether_type, void *header, const uint8_t *rss_key_be)
 {
+	uint32_t input_len;
+	uint32_t rss = 0;
+
+	switch (rte_be_to_cpu_16(ether_type)) {
+	case RTE_ETHER_TYPE_IPV4:
+		struct rte_ipv4_tuple ipv4_tuple;
+		struct rte_ipv4_hdr *ipv4_hdr = header;
+
+		ipv4_tuple.src_addr = rte_be_to_cpu_32(ipv4_hdr->src_addr);
+		ipv4_tuple.dst_addr = rte_be_to_cpu_32(ipv4_hdr->dst_addr);
+		input_len = RTE_THASH_V4_L3_LEN;
+
+		rss = rte_softrss_be((uint32_t *)&ipv4_tuple, input_len, rss_key_be);
+		break;
+	case RTE_ETHER_TYPE_IPV6:
+		struct rte_ipv6_tuple ipv6_tuple;
+		struct rte_ipv6_hdr *ipv6_hdr = header;
+
+		rte_thash_load_v6_addrs(ipv6_hdr,
+					(union rte_thash_tuple *)&ipv6_tuple);
+		input_len = RTE_THASH_V6_L3_LEN;
+
+		rss = rte_softrss_be((uint32_t *)&ipv6_tuple, input_len, rss_key_be);
+		break;
+	}
+
+	return rss;
+}
+
+static int
+zmq_poll_socket(void *args)
+{
+	struct rte_eth_dev *dev = args;
+	struct pmd_internals *internals = dev->data->dev_private;
+
+	/* Main loop */
+	while (1) {
+		zmq_msg_t msg;
+		void *msg_data;
+		int caplen;
+
+		int ret = zmq_msg_init(&msg);
+		if (ret == -1) {
+			PMD_LOG(ERR, "Failed to init zmq message");
+			return -1;
+		}
+
+		caplen = msg_recv_nonempty(&msg, internals->socket, ZMQ_DONTWAIT);
+		if (caplen < 0) {
+			zmq_msg_close(&msg);
+
+			if (errno != EAGAIN) {
+				PMD_LOG(ERR, "error receiving ZMQ msg: %s", zmq_strerror(errno));
+				return -1;
+			}
+
+			continue;
+		}
+
+		msg_data = zmq_msg_data(&msg);
+
+		struct rte_ether_hdr *eth_header = (struct rte_ether_hdr *)msg_data;
+
+		uint32_t rss = softrss_be(eth_header->ether_type,
+							(char *)msg_data + RTE_ETHER_HDR_LEN,
+							internals->rss_key_be);
+
+		struct zmq_rx_queue *q = &internals->rx[rss % dev->data->nb_rx_queues];
+
+		struct raw_zmq_packet *raw_packet = rte_malloc("raw_packet", sizeof(struct raw_zmq_packet), 0);
+		raw_packet->data = msg_data;
+		raw_packet->msg = msg;
+		raw_packet->len = caplen;
+
+		if (!rte_ring_sp_enqueue(q->ring, raw_packet))
+			return -1;
+	}
+
+	return 0;
+}
+
+static struct rte_service_spec zmq_poll_service = {"zmq_poll_service", zmq_poll_socket, NULL, 0, 0};
+
+static int
+eth_dev_configure(struct rte_eth_dev *dev)
+{
+	struct pmd_internals *internals = dev->data->dev_private;
+	int ret;
+	uint32_t service_id;
+
+	zmq_poll_service.callback_userdata = dev;
+	ret = rte_service_component_register(&zmq_poll_service, &service_id);
+	if (ret) {
+		PMD_LOG(ERR, "Failed to start service component");
+		return -1;
+	}
+	internals->poll_service_id = service_id;
+
+	rte_service_component_runstate_set(service_id, 1);
+
+	ret = rte_service_runstate_set(service_id, 1);
+	if (ret)
+		return -ENOEXEC;
+
+	int core = 1;
+	ret = rte_service_lcore_add(core);
+	if (ret && ret != -EALREADY)
+		PMD_LOG(INFO, "core %d added ret %d\n", core, ret);
+
+	ret = rte_service_lcore_start(core);
+	if (ret && ret != -EALREADY)
+		PMD_LOG(INFO, "core %d start ret %d\n", core, ret);
+
+	if (rte_service_map_lcore_set(service_id, core, 1))
+		PMD_LOG(ERR, "failed to map lcore %d\n", core);
+
 	return 0;
 }
 
@@ -374,8 +510,8 @@ eth_dev_info(struct rte_eth_dev *dev,
 
 	dev_info->max_mac_addrs = 1;
 	dev_info->max_rx_pktlen = (uint32_t)-1;
-	dev_info->max_rx_queues = dev->data->nb_rx_queues;
-	dev_info->max_tx_queues = dev->data->nb_tx_queues;
+	dev_info->max_rx_queues = RTE_MAX_QUEUES_PER_PORT;
+	dev_info->max_tx_queues = RTE_MAX_QUEUES_PER_PORT;
 	dev_info->min_rx_bufsize = 0;
 
 	return 0;
@@ -404,6 +540,10 @@ eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 	q->socket = internals->socket;
 	q->internals = internals;
 	zmq_msg_init(&q->msg);
+
+	char ring_name[RTE_RING_NAMESIZE];
+	snprintf(ring_name, sizeof(ring_name), "rx_%d", rx_queue_id);
+	q->ring = rte_ring_create(ring_name, 256, SOCKET_ID_ANY, RING_F_SP_ENQ|RING_F_SC_DEQ);
 
 	dev->data->rx_queues[rx_queue_id] = q;
 	return 0;
@@ -631,6 +771,14 @@ set_pkt_ops(struct rte_eth_dev *eth_dev)
 	}
 }
 
+static const uint8_t default_rss_key[] = {
+	0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+	0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+	0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+	0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+	0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+};
+
 static int
 pmd_zmq_probe(struct rte_vdev_device *dev)
 {
@@ -649,6 +797,8 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	const char *name = rte_vdev_device_name(dev);
 	const char *params = rte_vdev_device_args(dev);
+	if (rte_openlog_stream(stderr) < 0)
+		rte_panic("Failed to open log stream");
 
 	PMD_LOG(INFO, "Initializing pmd_zmq for %s", name);
 	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {
@@ -765,6 +915,10 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	set_nb_queues(data);
 	set_pkt_ops(eth_dev);
+	rte_convert_rss_key((const uint32_t *)default_rss_key,
+		(uint32_t *)internals->rss_key_be,
+			RTE_DIM(default_rss_key));
+
 
 	data->dev_link = pmd_link;
 	data->mac_addrs = &internals->eth_addr;
@@ -791,9 +945,24 @@ pmd_zmq_remove(struct rte_vdev_device *dev)
 	if (eth_dev == NULL)
 		return 0; /* port already released */
 
+	struct pmd_internals *internals = eth_dev->data->dev_private;
+
+	int core = 1;
+	// FIXME: Service not stopping
+	int ret = rte_service_runstate_set(internals->poll_service_id, 0);
+	if (ret != 0)
+		PMD_LOG(ERR, "Service stop failed");
+
+	ret = rte_service_lcore_stop(core);
+	if (ret && ret != -EALREADY)
+		PMD_LOG(INFO, "lcore stop = %d", ret);
+
+	ret = rte_service_lcore_del(core);
+	if (ret && ret != -EINVAL)
+		PMD_LOG(INFO, "lcore del = %d", ret);
+
 	eth_dev_close(eth_dev);
 
-	struct pmd_internals *internals = eth_dev->data->dev_private;
 	zmq_close(internals->socket);
 	zmq_ctx_term(internals->ctx);
 

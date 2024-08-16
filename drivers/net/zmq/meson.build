@@ -11,3 +11,5 @@ sources = files(
 )
 
 ext_deps += zmq_dep
+
+deps += ['hash']

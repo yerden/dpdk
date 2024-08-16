@@ -33,10 +33,14 @@
  */
 #define ETH_ZMQ_SOCKET_TYPE_ARG            "type"
 
+/* Specify packet ring size for each rx queue. */
+#define ETH_ZMQ_RX_RING_SIZE_ARG           "ring_size"
+
 static const char *valid_arguments[] = {
 	ETH_ZMQ_METHOD_ARG,
 	ETH_ZMQ_SOCKET_TYPE_ARG,
 	ETH_ZMQ_ENDPOINT_ARG,
+	ETH_ZMQ_RX_RING_SIZE_ARG,
 	NULL
 };
 
@@ -83,6 +87,7 @@ struct pmd_options {
 	int do_tx; /* if pub */
 	int socket_type;
 	void *socket;
+	unsigned int rx_ring_size;
 
 	attach_fn *attach;
 };
@@ -100,6 +105,7 @@ struct pmd_internals {
 
 	/* zmq SUB socket. */
 	struct zmq_rx_queue rx[RTE_MAX_QUEUES_PER_PORT];
+	unsigned int rx_ring_size;
 
 	/* zmq PUB socket. */
 	struct zmq_tx_queue tx[RTE_MAX_QUEUES_PER_PORT];
@@ -417,6 +423,12 @@ zmq_poll_socket(void *args)
 	struct rte_eth_dev *dev = args;
 	struct pmd_internals *internals = dev->data->dev_private;
 
+	if (internals->socket == NULL) {
+		rte_delay_ms(1);
+		PMD_LOG(INFO, "Service deinitialized");
+		return -1;
+	}
+
 	/* Main loop */
 	while (1) {
 		zmq_msg_t msg;
@@ -452,6 +464,10 @@ zmq_poll_socket(void *args)
 		struct zmq_rx_queue *q = &internals->rx[rss % dev->data->nb_rx_queues];
 
 		struct raw_zmq_packet *raw_packet = rte_malloc("raw_packet", sizeof(struct raw_zmq_packet), 0);
+		if (raw_packet == NULL) {
+			PMD_LOG(ERR, "Failed to allocate zeromq packet");
+			return -ENOMEM;
+		}
 		raw_packet->data = msg_data;
 		raw_packet->msg = msg;
 		raw_packet->len = caplen;
@@ -543,7 +559,10 @@ eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 
 	char ring_name[RTE_RING_NAMESIZE];
 	snprintf(ring_name, sizeof(ring_name), "rx_%d", rx_queue_id);
-	q->ring = rte_ring_create(ring_name, 256, SOCKET_ID_ANY, RING_F_SP_ENQ|RING_F_SC_DEQ);
+	q->ring = rte_ring_create(ring_name,
+	                          internals->rx_ring_size,
+	                          SOCKET_ID_ANY,
+	                          RING_F_SP_ENQ|RING_F_SC_DEQ);
 
 	dev->data->rx_queues[rx_queue_id] = q;
 	return 0;
@@ -735,6 +754,34 @@ get_endpoint(const char *key __rte_unused,
 	return opts->attach(opts->socket, value);
 }
 
+static int
+get_rx_ring_size(const char *key __rte_unused,
+		const char *value, void *arg)
+{
+	if (*value == '-') {
+		PMD_LOG(ERR, "Ring size cannot be negative");
+		return -EINVAL;
+	}
+
+	struct pmd_options *opts = arg;
+	char *end = NULL;
+	unsigned long ring_size = strtoul(value, &end, 10);
+
+	if (end == NULL) {
+		PMD_LOG(ERR, "Invalid characters in ring size %s", end);
+		return -EINVAL;
+	}
+
+	if ((ring_size & (ring_size - 1)) != 0 || ring_size == 0) {
+		PMD_LOG(ERR, "Ring size must be a power of 2, not zero and bigger than 0");
+		return -EINVAL;
+	}
+
+	opts->rx_ring_size = ring_size;
+
+	return 0;
+}
+
 static void
 set_nb_queues(struct rte_eth_dev_data *data)
 {
@@ -788,6 +835,7 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	struct pmd_options args = {
 		/* By default, we do zmq_connect() */
 		.attach = zmq_connect,
+		.rx_ring_size = 256,
 	};
 
 	struct rte_kvargs *kvlist = NULL;
@@ -838,8 +886,8 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	/* find out what socket we need */
 	ret = rte_kvargs_process(kvlist,
-			ETH_ZMQ_SOCKET_TYPE_ARG,
-			&get_socket_type, &args);
+	                         ETH_ZMQ_SOCKET_TYPE_ARG,
+	                         &get_socket_type, &args);
 	if (ret < 0) {
 		zmq_ctx_term(ctx);
 		rte_kvargs_free(kvlist);
@@ -847,8 +895,17 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	}
 
 	ret = rte_kvargs_process(kvlist,
-			ETH_ZMQ_METHOD_ARG,
-			&get_method, &args);
+	                         ETH_ZMQ_METHOD_ARG,
+	                         &get_method, &args);
+	if (ret < 0) {
+		zmq_ctx_term(ctx);
+		rte_kvargs_free(kvlist);
+		return ret;
+	}
+
+	ret = rte_kvargs_process(kvlist,
+	                         ETH_ZMQ_RX_RING_SIZE_ARG,
+	                         &get_rx_ring_size, &args);
 	if (ret < 0) {
 		zmq_ctx_term(ctx);
 		rte_kvargs_free(kvlist);
@@ -865,8 +922,8 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	args.socket = socket;
 
 	ret = rte_kvargs_process(kvlist,
-			ETH_ZMQ_ENDPOINT_ARG,
-			&get_endpoint, &args);
+	                         ETH_ZMQ_ENDPOINT_ARG,
+	                         &get_endpoint, &args);
 	/* end of use kvlist */
 	rte_kvargs_free(kvlist);
 
@@ -909,6 +966,7 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	internals->socket = socket;
 	internals->port_id = eth_dev->data->port_id;
 	internals->socket_type = args.socket_type;
+	internals->rx_ring_size = args.rx_ring_size;
 
 	struct rte_eth_dev_data *data;
 	data = eth_dev->data;
@@ -947,19 +1005,8 @@ pmd_zmq_remove(struct rte_vdev_device *dev)
 
 	struct pmd_internals *internals = eth_dev->data->dev_private;
 
-	int core = 1;
-	// FIXME: Service not stopping
-	int ret = rte_service_runstate_set(internals->poll_service_id, 0);
-	if (ret != 0)
+	if (rte_service_runstate_set(internals->poll_service_id, 0) != 0)
 		PMD_LOG(ERR, "Service stop failed");
-
-	ret = rte_service_lcore_stop(core);
-	if (ret && ret != -EALREADY)
-		PMD_LOG(INFO, "lcore stop = %d", ret);
-
-	ret = rte_service_lcore_del(core);
-	if (ret && ret != -EINVAL)
-		PMD_LOG(INFO, "lcore del = %d", ret);
 
 	eth_dev_close(eth_dev);
 
@@ -982,4 +1029,5 @@ RTE_PMD_REGISTER_ALIAS(net_zmq, eth_zmq);
 RTE_PMD_REGISTER_PARAM_STRING(net_zmq,
 	ETH_ZMQ_METHOD_ARG"=<string> "
 	ETH_ZMQ_ENDPOINT_ARG"=<string> "
-	ETH_ZMQ_SOCKET_TYPE_ARG"=<string> ");
+	ETH_ZMQ_SOCKET_TYPE_ARG"=<string> "
+	ETH_ZMQ_RX_RING_SIZE_ARG"=<int> ");

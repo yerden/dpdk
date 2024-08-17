@@ -5,6 +5,7 @@
 
 #include <stdlib.h>
 #include <strings.h>
+#include <math.h>
 #include <zmq.h>
 
 #include <ethdev_vdev.h>
@@ -259,6 +260,9 @@ eth_zmq_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	incr_cnt(&h->stat.pkts, num_rx);
 	incr_cnt(&h->stat.bytes, rx_bytes);
 
+	if (num_rx != 0) {
+		PMD_LOG(DEBUG, "Burst of %d packets", num_rx);
+	}
 	return num_rx;
 }
 
@@ -461,7 +465,9 @@ zmq_poll_socket(void *args)
 							(char *)msg_data + RTE_ETHER_HDR_LEN,
 							internals->rss_key_be);
 
-		struct zmq_rx_queue *q = &internals->rx[rss % dev->data->nb_rx_queues];
+		uint32_t bitmask = (1 << (uint32_t)log2(dev->data->nb_rx_queues)) - 1;
+		PMD_LOG(DEBUG, "Queue picked for forwrading %d/%d", rss & bitmask, dev->data->nb_rx_queues);
+		struct zmq_rx_queue *q = &internals->rx[rss & bitmask];
 
 		struct raw_zmq_packet *raw_packet = rte_malloc("raw_packet", sizeof(struct raw_zmq_packet), 0);
 		if (raw_packet == NULL) {
@@ -472,8 +478,10 @@ zmq_poll_socket(void *args)
 		raw_packet->msg = msg;
 		raw_packet->len = caplen;
 
-		if (!rte_ring_sp_enqueue(q->ring, raw_packet))
+		if (rte_ring_sp_enqueue(q->ring, raw_packet)) {
+			PMD_LOG(ERR, "Packet enqueue failed %d", ret);
 			return -1;
+		}
 	}
 
 	return 0;
@@ -484,6 +492,13 @@ static struct rte_service_spec zmq_poll_service = {"zmq_poll_service", zmq_poll_
 static int
 eth_dev_configure(struct rte_eth_dev *dev)
 {
+	uint16_t nb_rx_queues = dev->data->nb_rx_queues;
+
+	if ((nb_rx_queues & (nb_rx_queues - 1)) != 0) {
+		PMD_LOG(ERR, "Number of rx queues must be a power of 2");
+		return -1;
+	}
+
 	struct pmd_internals *internals = dev->data->dev_private;
 	int ret;
 	uint32_t service_id;

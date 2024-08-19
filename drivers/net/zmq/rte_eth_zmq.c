@@ -861,8 +861,6 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	const char *name = rte_vdev_device_name(dev);
 	const char *params = rte_vdev_device_args(dev);
-	if (rte_openlog_stream(stderr) < 0)
-		rte_panic("Failed to open log stream");
 
 	PMD_LOG(INFO, "Initializing pmd_zmq for %s", name);
 	if (rte_eal_process_type() == RTE_PROC_SECONDARY) {

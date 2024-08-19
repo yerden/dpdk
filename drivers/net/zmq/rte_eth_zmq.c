@@ -37,15 +37,23 @@
 /* Specify packet ring size for each rx queue. */
 #define ETH_ZMQ_RX_RING_SIZE_ARG           "ring_size"
 
+/* Specify lcore id for poll service to run on 
+ * 
+ * Poll service must not be run on the same core as rx queue
+ */
+#define ETH_ZMQ_RX_SERVICE_LCORE_ID_ARG    "lcore_service_id"
+
 static const char *valid_arguments[] = {
 	ETH_ZMQ_METHOD_ARG,
 	ETH_ZMQ_SOCKET_TYPE_ARG,
 	ETH_ZMQ_ENDPOINT_ARG,
 	ETH_ZMQ_RX_RING_SIZE_ARG,
+	ETH_ZMQ_RX_SERVICE_LCORE_ID_ARG,
 	NULL
 };
 
 #define RSS_KEY_SIZE                       40
+#define RSS_TABLE_SIZE                     (1 << 7)
 
 static const uint8_t default_rss_key[] = {
 	0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
@@ -97,6 +105,7 @@ struct pmd_options {
 	int socket_type;
 	void *socket;
 	unsigned int rx_ring_size;
+	unsigned int service_lcore_id;
 
 	attach_fn *attach;
 };
@@ -109,12 +118,14 @@ struct pmd_internals {
 	void *socket;
 	int socket_type;
 	uint32_t poll_service_id;
+	uint32_t poll_lcore_id;
 
 	uint8_t rss_key_be[RSS_KEY_SIZE];
 
 	/* zmq SUB socket. */
 	struct zmq_rx_queue rx[RTE_MAX_QUEUES_PER_PORT];
 	unsigned int rx_ring_size;
+	uint16_t rx_reta[128];
 
 	/* zmq PUB socket. */
 	struct zmq_tx_queue tx[RTE_MAX_QUEUES_PER_PORT];
@@ -270,7 +281,7 @@ eth_zmq_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 	incr_cnt(&h->stat.bytes, rx_bytes);
 
 	if (num_rx != 0) {
-		PMD_LOG(DEBUG, "Burst of %d packets", num_rx);
+		PMD_LOG(DEBUG, "Rx burst of %d packets", num_rx);
 	}
 	return num_rx;
 }
@@ -485,9 +496,10 @@ zmq_poll_socket(void *args)
 		                          (char *)msg_data + RTE_ETHER_HDR_LEN,
 		                          internals->rss_key_be);
 
-		uint32_t bitmask = (1 << (uint32_t)log2(dev->data->nb_rx_queues)) - 1;
-		PMD_LOG(DEBUG, "Queue picked for forwrading %d/%d", rss & bitmask, dev->data->nb_rx_queues);
-		struct zmq_rx_queue *q = &internals->rx[rss & bitmask];
+		uint32_t bitmask = RSS_TABLE_SIZE - 1;
+		uint16_t rx_index = internals->rx_reta[rss & bitmask];
+		PMD_LOG(DEBUG, "Queue picked for forwrading %d/%d", rx_index, dev->data->nb_rx_queues - 1);
+		struct zmq_rx_queue *q = &internals->rx[rx_index];
 
 		struct raw_zmq_packet *raw_packet = rte_malloc("raw_packet", sizeof(struct raw_zmq_packet), 0);
 		if (raw_packet == NULL) {
@@ -498,12 +510,29 @@ zmq_poll_socket(void *args)
 		raw_packet->msg = msg;
 		raw_packet->len = caplen;
 
-		if (rte_ring_sp_enqueue(q->ring, raw_packet)) {
+		if ((ret = rte_ring_sp_enqueue(q->ring, raw_packet)) == -ENOBUFS) {
 			PMD_LOG(ERR, "Packet enqueue failed %d", ret);
 			return -1;
 		}
 	}
 
+	return 0;
+}
+
+static int
+zmq_fill_rss_table(struct rte_eth_dev *dev, size_t queue_num)
+{
+	struct pmd_internals *internals = dev->data->dev_private;
+	size_t i;
+	uint16_t val;
+
+	for (i = 0; i < RSS_TABLE_SIZE; ++i) {
+		val = (queue_num - i) % queue_num;
+		if (val >= dev->data->nb_rx_queues)
+			return -1;
+
+		internals->rx_reta[i] = val;
+	}
 	return 0;
 }
 
@@ -513,15 +542,13 @@ static int
 eth_dev_configure(struct rte_eth_dev *dev)
 {
 	uint16_t nb_rx_queues = dev->data->nb_rx_queues;
-
-	if ((nb_rx_queues & (nb_rx_queues - 1)) != 0) {
-		PMD_LOG(ERR, "Number of rx queues must be a power of 2");
-		return -1;
-	}
-
 	struct pmd_internals *internals = dev->data->dev_private;
 	int ret;
 	uint32_t service_id;
+
+	ret = zmq_fill_rss_table(dev, nb_rx_queues);
+	if (ret < 0)
+		PMD_LOG(ERR, "Failed to fill rss indirection table");
 
 	zmq_poll_service.callback_userdata = dev;
 	ret = rte_service_component_register(&zmq_poll_service, &service_id);
@@ -537,17 +564,19 @@ eth_dev_configure(struct rte_eth_dev *dev)
 	if (ret)
 		return -ENOEXEC;
 
-	int core = 1;
-	ret = rte_service_lcore_add(core);
-	if (ret && ret != -EALREADY)
-		PMD_LOG(INFO, "core %d added ret %d\n", core, ret);
+	unsigned int lcore_id = internals->poll_lcore_id;
+	PMD_LOG(INFO, "Zmq poll service mapped to lcore: %d", lcore_id);
 
-	ret = rte_service_lcore_start(core);
+	ret = rte_service_lcore_add(lcore_id);
 	if (ret && ret != -EALREADY)
-		PMD_LOG(INFO, "core %d start ret %d\n", core, ret);
+		PMD_LOG(INFO, "core %d added ret %d\n", lcore_id, ret);
 
-	if (rte_service_map_lcore_set(service_id, core, 1))
-		PMD_LOG(ERR, "failed to map lcore %d\n", core);
+	ret = rte_service_lcore_start(lcore_id);
+	if (ret && ret != -EALREADY)
+		PMD_LOG(INFO, "core %d start ret %d\n", lcore_id, ret);
+
+	if (rte_service_map_lcore_set(service_id, lcore_id, 1))
+		PMD_LOG(ERR, "failed to map lcore %d\n", lcore_id);
 
 	return 0;
 }
@@ -821,6 +850,29 @@ get_rx_ring_size(const char *key __rte_unused,
 	return 0;
 }
 
+static int
+get_rx_service_lcore_id(const char *key __rte_unused,
+                 const char *value, void *arg)
+{
+	struct pmd_options *opts = arg;
+	char *end = NULL;
+	unsigned int service_lcore_id = strtoul(value, &end, 10);
+
+	if (end == NULL) {
+		PMD_LOG(ERR, "Invalid characters in lcore_service_id %s", end);
+		return -EINVAL;
+	}
+
+	if (!rte_lcore_is_enabled(service_lcore_id)) {
+		PMD_LOG(ERR, "Lcore assigned for service: %u is not enabled", service_lcore_id);
+		return -EINVAL;
+	}
+
+	opts->service_lcore_id = service_lcore_id;
+
+	return 0;
+}
+
 static void
 set_nb_queues(struct rte_eth_dev_data *data)
 {
@@ -941,6 +993,15 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 		return ret;
 	}
 
+	ret = rte_kvargs_process(kvlist,
+	                         ETH_ZMQ_RX_SERVICE_LCORE_ID_ARG,
+	                         &get_rx_service_lcore_id, &args);
+	if (ret < 0) {
+		zmq_ctx_term(ctx);
+		rte_kvargs_free(kvlist);
+		return ret;
+	}
+
 	if ((socket = zmq_socket(ctx, args.socket_type)) == NULL) {
 		PMD_LOG(ERR, "unable to create ZMQ socket: %s (%d)", zmq_strerror(errno), errno);
 		zmq_ctx_term(ctx);
@@ -996,6 +1057,7 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	internals->port_id = eth_dev->data->port_id;
 	internals->socket_type = args.socket_type;
 	internals->rx_ring_size = args.rx_ring_size;
+	internals->poll_lcore_id = args.service_lcore_id;
 
 	struct rte_eth_dev_data *data;
 	data = eth_dev->data;
@@ -1055,4 +1117,5 @@ RTE_PMD_REGISTER_PARAM_STRING(net_zmq,
 	ETH_ZMQ_METHOD_ARG"=<string> "
 	ETH_ZMQ_ENDPOINT_ARG"=<string> "
 	ETH_ZMQ_SOCKET_TYPE_ARG"=<string> "
-	ETH_ZMQ_RX_RING_SIZE_ARG"=<int> ");
+	ETH_ZMQ_RX_RING_SIZE_ARG"=<int> "
+	ETH_ZMQ_RX_SERVICE_LCORE_ID_ARG"=<int> ");

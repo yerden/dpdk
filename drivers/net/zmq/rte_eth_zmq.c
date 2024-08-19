@@ -47,6 +47,14 @@ static const char *valid_arguments[] = {
 
 #define RSS_KEY_SIZE                       40
 
+static const uint8_t default_rss_key[] = {
+	0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+	0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+	0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+	0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+	0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+};
+
 struct pmd_internals;
 
 struct queue_stat {
@@ -342,6 +350,8 @@ eth_zmq_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 static int
 eth_dev_start(struct rte_eth_dev *dev)
 {
+	struct rte_eth_rss_conf rss_conf;
+	struct pmd_internals *internals = dev->data->dev_private;
 	uint16_t i;
 
 	if (dev == NULL)
@@ -353,6 +363,15 @@ eth_dev_start(struct rte_eth_dev *dev)
 		dev->data->rx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
 	for (i = 0; i < dev->data->nb_tx_queues; i++)
 		dev->data->tx_queue_state[i] = RTE_ETH_QUEUE_STATE_STARTED;
+
+	rss_conf = dev->data->dev_conf.rx_adv_conf.rss_conf;
+
+	const uint8_t *rss_key = rss_conf.rss_key ? rss_conf.rss_key : default_rss_key;
+	rte_convert_rss_key((const uint32_t *)rss_key,
+	                    (uint32_t *)internals->rss_key_be,
+	                    RTE_DIM(default_rss_key));
+
+	PMD_LOG(DEBUG, "Successfully configured rss default rss key used: %d", rss_conf.rss_key == NULL);
 
 	return 0;
 }
@@ -545,6 +564,10 @@ eth_dev_info(struct rte_eth_dev *dev,
 	dev_info->max_rx_queues = RTE_MAX_QUEUES_PER_PORT;
 	dev_info->max_tx_queues = RTE_MAX_QUEUES_PER_PORT;
 	dev_info->min_rx_bufsize = 0;
+	dev_info->hash_key_size = RSS_KEY_SIZE;
+	dev_info->flow_type_rss_offloads = RTE_ETH_RSS_IP;
+	dev_info->rss_algo_capa = RTE_ETH_HASH_ALGO_CAPA_MASK(DEFAULT) |
+	                          RTE_ETH_HASH_ALGO_CAPA_MASK(TOEPLITZ);
 
 	return 0;
 }
@@ -834,14 +857,6 @@ set_pkt_ops(struct rte_eth_dev *eth_dev)
 	}
 }
 
-static const uint8_t default_rss_key[] = {
-	0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
-	0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
-	0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
-	0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
-	0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
-};
-
 static int
 pmd_zmq_probe(struct rte_vdev_device *dev)
 {
@@ -987,10 +1002,6 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	set_nb_queues(data);
 	set_pkt_ops(eth_dev);
-	rte_convert_rss_key((const uint32_t *)default_rss_key,
-	                    (uint32_t *)internals->rss_key_be,
-	                    RTE_DIM(default_rss_key));
-
 
 	data->dev_link = pmd_link;
 	data->mac_addrs = &internals->eth_addr;

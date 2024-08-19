@@ -143,7 +143,7 @@ incr_cnt_one(volatile unsigned long *p)
 
 static uint16_t
 eth_zmq_no_rx(void *q __rte_unused, struct rte_mbuf **bufs __rte_unused,
-		uint16_t nb_bufs __rte_unused)
+              uint16_t nb_bufs __rte_unused)
 {
 	return 0;
 }
@@ -151,7 +151,7 @@ eth_zmq_no_rx(void *q __rte_unused, struct rte_mbuf **bufs __rte_unused,
 /* borrowed from pcap pmd */
 static int
 eth_zmq_rx_jumbo(struct rte_mempool *mb_pool, struct rte_mbuf *mbuf,
-		const u_char *data, uint16_t data_len)
+                 const u_char *data, uint16_t data_len)
 {
 	/* Copy the first segment. */
 	uint16_t len = rte_pktmbuf_tailroom(mbuf);
@@ -234,8 +234,9 @@ eth_zmq_rx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 
 		if (raw_packet->len <= rte_pktmbuf_tailroom(m)) {
 			/* packet will fit in the mbuf, can copy it */
-			rte_memcpy(rte_pktmbuf_mtod(m, void *), (void *)raw_packet->data,
-					raw_packet->len);
+			rte_memcpy(rte_pktmbuf_mtod(m, void *),
+			           (void *)raw_packet->data,
+			           raw_packet->len);
 			m->data_len = (uint16_t)raw_packet->len;
 		} else {
 			/* Try read jumbo frame into multi mbufs. */
@@ -309,8 +310,8 @@ eth_zmq_tx(void *queue, struct rte_mbuf **bufs, uint16_t nb_pkts)
 		if (unlikely(!rte_pktmbuf_is_contiguous(m) &&
 				len > sizeof(temp_data))) {
 			PMD_LOG(ERR,
-				"Dropping multi segment packet. Size (%zd) > max size (%zd).",
-				len, sizeof(temp_data));
+			        "Dropping multi segment packet. Size (%zd) > max size (%zd).",
+			        len, sizeof(temp_data));
 			rte_pktmbuf_free(m);
 			continue;
 		}
@@ -378,7 +379,7 @@ static int
 eth_dev_close(struct rte_eth_dev *dev)
 {
 	PMD_LOG(INFO, "Closing zmq ethdev on NUMA socket %u",
-			rte_socket_id());
+	        rte_socket_id());
 
 	if (rte_eal_process_type() != RTE_PROC_PRIMARY)
 		return 0;
@@ -411,7 +412,7 @@ softrss_be(rte_be16_t ether_type, void *header, const uint8_t *rss_key_be)
 		struct rte_ipv6_hdr *ipv6_hdr = header;
 
 		rte_thash_load_v6_addrs(ipv6_hdr,
-					(union rte_thash_tuple *)&ipv6_tuple);
+		                        (union rte_thash_tuple *)&ipv6_tuple);
 		input_len = RTE_THASH_V6_L3_LEN;
 
 		rss = rte_softrss_be((uint32_t *)&ipv6_tuple, input_len, rss_key_be);
@@ -462,8 +463,8 @@ zmq_poll_socket(void *args)
 		struct rte_ether_hdr *eth_header = (struct rte_ether_hdr *)msg_data;
 
 		uint32_t rss = softrss_be(eth_header->ether_type,
-							(char *)msg_data + RTE_ETHER_HDR_LEN,
-							internals->rss_key_be);
+		                          (char *)msg_data + RTE_ETHER_HDR_LEN,
+		                          internals->rss_key_be);
 
 		uint32_t bitmask = (1 << (uint32_t)log2(dev->data->nb_rx_queues)) - 1;
 		PMD_LOG(DEBUG, "Queue picked for forwrading %d/%d", rss & bitmask, dev->data->nb_rx_queues);
@@ -534,7 +535,7 @@ eth_dev_configure(struct rte_eth_dev *dev)
 
 static int
 eth_dev_info(struct rte_eth_dev *dev,
-		struct rte_eth_dev_info *dev_info)
+             struct rte_eth_dev_info *dev_info)
 {
 	if ((dev == NULL) || (dev_info == NULL))
 		return -EINVAL;
@@ -550,10 +551,10 @@ eth_dev_info(struct rte_eth_dev *dev,
 
 static int
 eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
-		uint16_t nb_rx_desc __rte_unused,
-		unsigned int socket_id __rte_unused,
-		const struct rte_eth_rxconf *rx_conf __rte_unused,
-		struct rte_mempool *mb_pool)
+                   uint16_t nb_rx_desc __rte_unused,
+                   unsigned int socket_id __rte_unused,
+                   const struct rte_eth_rxconf *rx_conf __rte_unused,
+                   struct rte_mempool *mb_pool)
 {
 	struct pmd_internals *internals;
 	struct zmq_rx_queue *q;
@@ -585,9 +586,9 @@ eth_rx_queue_setup(struct rte_eth_dev *dev, uint16_t rx_queue_id,
 
 static int
 eth_tx_queue_setup(struct rte_eth_dev *dev, uint16_t tx_queue_id,
-		uint16_t nb_tx_desc __rte_unused,
-		unsigned int socket_id __rte_unused,
-		const struct rte_eth_txconf *tx_conf __rte_unused)
+                   uint16_t nb_tx_desc __rte_unused,
+                   unsigned int socket_id __rte_unused,
+                   const struct rte_eth_txconf *tx_conf __rte_unused)
 {
 	struct pmd_internals *internals;
 	struct zmq_tx_queue *q;
@@ -626,14 +627,14 @@ eth_mtu_set(struct rte_eth_dev *dev __rte_unused, uint16_t mtu __rte_unused)
 
 static int
 eth_link_update(struct rte_eth_dev *dev __rte_unused,
-		int wait_to_complete __rte_unused)
+                int wait_to_complete __rte_unused)
 {
 	return 0;
 }
 
 static int
 eth_mac_address_set(__rte_unused struct rte_eth_dev *dev,
-		__rte_unused struct rte_ether_addr *addr)
+                    __rte_unused struct rte_ether_addr *addr)
 {
 	return 0;
 }
@@ -663,8 +664,8 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *igb_stats)
 	internal = dev->data->dev_private;
 
 	num_stats = RTE_MIN((unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS,
-			RTE_MIN(dev->data->nb_rx_queues,
-				RTE_DIM(internal->rx)));
+	                    RTE_MIN(dev->data->nb_rx_queues, 
+	                            RTE_DIM(internal->rx)));
 	for (i = 0; i < num_stats; i++) {
 		/* NOTE: review for atomic access */
 		igb_stats->q_ipackets[i] = load_cnt(&internal->rx[i].stat.pkts);
@@ -672,8 +673,8 @@ eth_stats_get(struct rte_eth_dev *dev, struct rte_eth_stats *igb_stats)
 	}
 
 	num_stats = RTE_MIN((unsigned int)RTE_ETHDEV_QUEUE_STAT_CNTRS,
-			RTE_MIN(dev->data->nb_tx_queues,
-				RTE_DIM(internal->tx)));
+	                    RTE_MIN(dev->data->nb_tx_queues,
+	                            RTE_DIM(internal->tx)));
 	for (i = 0; i < num_stats; i++) {
 		/* NOTE: review for atomic access */
 		igb_stats->q_opackets[i] = load_cnt(&internal->tx[i].stat.pkts);
@@ -723,7 +724,7 @@ static const struct eth_dev_ops ops = {
 
 static int
 get_method(const char *key __rte_unused,
-		const char *value, void *arg)
+           const char *value, void *arg)
 {
 	struct pmd_options *opts = arg;
 
@@ -741,7 +742,7 @@ get_method(const char *key __rte_unused,
 
 static int
 get_socket_type(const char *key __rte_unused,
-		const char *value, void *arg)
+                const char *value, void *arg)
 {
 	struct pmd_options *opts = arg;
 
@@ -763,7 +764,7 @@ get_socket_type(const char *key __rte_unused,
 
 static int
 get_endpoint(const char *key __rte_unused,
-		const char *value, void *arg)
+             const char *value, void *arg)
 {
 	struct pmd_options *opts = arg;
 	return opts->attach(opts->socket, value);
@@ -771,7 +772,7 @@ get_endpoint(const char *key __rte_unused,
 
 static int
 get_rx_ring_size(const char *key __rte_unused,
-		const char *value, void *arg)
+                 const char *value, void *arg)
 {
 	if (*value == '-') {
 		PMD_LOG(ERR, "Ring size cannot be negative");
@@ -882,8 +883,8 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 
 	if (params == NULL || *params == 0) {
 		PMD_LOG(ERR, "Specify zmq parameters, at least '%s' and '%s' is required",
-				ETH_ZMQ_ENDPOINT_ARG,
-				ETH_ZMQ_SOCKET_TYPE_ARG);
+		        ETH_ZMQ_ENDPOINT_ARG,
+		        ETH_ZMQ_SOCKET_TYPE_ARG);
 		return -EINVAL;
 	}
 
@@ -989,8 +990,8 @@ pmd_zmq_probe(struct rte_vdev_device *dev)
 	set_nb_queues(data);
 	set_pkt_ops(eth_dev);
 	rte_convert_rss_key((const uint32_t *)default_rss_key,
-		(uint32_t *)internals->rss_key_be,
-			RTE_DIM(default_rss_key));
+	                    (uint32_t *)internals->rss_key_be,
+	                    RTE_DIM(default_rss_key));
 
 
 	data->dev_link = pmd_link;
